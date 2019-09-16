@@ -136,6 +136,8 @@ const static std::unordered_set<std::string> reserved_names = {
     "while",
     "with",
     "yield",
+    "uninitialized",
+    "unchecked_cast",
 };
 
 struct PythonPrintPass {
@@ -341,6 +343,12 @@ struct PythonPrintPass {
 
     // subgraph may use this more than once, so disable inlining
     if (use.user->kind() == prim::fork)
+      return false;
+
+    // isinstance appearing in an if expression
+    // causes type refinement to occur, we dont
+    // want to since it has already been handled
+    if (v->node()->kind() == prim::isinstance)
       return false;
 
     return true;
@@ -1130,7 +1138,6 @@ struct PythonPrintPass {
         }
 
       } break;
-      case prim::unchecked_unwrap_optional:
       case aten::_unwrap_optional: {
         printOpName(stmt, node->kind());
         stmt << "(";
@@ -1146,6 +1153,10 @@ struct PythonPrintPass {
           stmt << useOf(node->input());
         }
         stmt << ")";
+      } break;
+      case prim::unchecked_cast: {
+        stmt << "unchecked_cast(" << node->output()->type()->python_str()
+             << ", " << useOf(node->input()) << ")";
       } break;
       case prim::isinstance: {
         stmt << "isinstance(" << useOf(node->input()) << ", ";
@@ -1545,6 +1556,7 @@ bool printerHasSpecialCaseFor(Symbol sym) {
       prim::SetAttr,
       prim::CallFunction,
       prim::isinstance,
+      prim::unchecked_cast,
   };
 
   // WARNING: by adding a value to this set, you are asserting that your
