@@ -19,6 +19,7 @@ import textwrap
 import zipfile
 from torch._utils_internal import get_file_path_2
 from torch.utils.dlpack import from_dlpack, to_dlpack
+from torch.utils import cpp_extension
 from torch._utils import _rebuild_tensor
 from torch._six import inf, nan, string_classes, istuple
 from itertools import product, combinations, combinations_with_replacement, permutations
@@ -6892,6 +6893,86 @@ class TestTorchDeviceType(TestCase):
         torch.inverse(matrix, out=matrix_inverse_out)
         self.assertEqual(matrix_inverse_out, matrix_inverse, 0, 'inverse value in-place')
 
+    def test_warning_catch(self):
+        source = '''
+        at::Tensor uncatched(at::Tensor x) {
+            TORCH_WARN("foo");
+            return x.cos();
+        }
+
+        // error_type:
+        // 0: no error
+        // 1: torch::TypeError
+        // 2: python_error()
+        // 3: py::error_already_set
+        at::Tensor catched(at::Tensor x, int error_type) {
+            HANDLE_TH_ERRORS
+
+            std::ostringstream err_stream;
+            err_stream << "Error with "  << x.type();
+
+            TORCH_WARN(err_stream.str());
+            if(error_type == 1) {
+                throw torch::TypeError(err_stream.str().c_str());
+            }
+            if(error_type == 2) {
+                PyObject* obj = PyTuple_New(-1);
+                TORCH_CHECK(!obj);
+                // Pretend it was caught in a different thread and restored here
+                auto e = python_error();
+                e.persist();
+                e.restore();
+                throw e;
+            }
+            if(error_type == 3) {
+                throw py::key_error(err_stream.str());
+            }
+            return x.cos();
+            END_HANDLE_TH_ERRORS_PYBIND
+        }
+        '''
+
+
+        warn_mod = cpp_extension.load_inline(name='warn_mod',
+                                             cpp_sources=[source],
+                                             functions=['uncatched', 'catched'])
+
+
+        # Ensure double type for hard-coded c name below
+        t = torch.rand(2).double()
+        with warnings.catch_warnings(record=True) as w:
+            # Uncatched should not be detected
+            warn_mod.uncatched(t)
+            self.assertEqual(len(w), 0)
+
+            # Catched with no error should be detected
+            warn_mod.catched(t, 0)
+            self.assertEqual(len(w), 1)
+
+            # Catched with cpp error should not be detected
+            with self.assertRaisesRegex(TypeError, t.type()):
+                warn_mod.catched(t, 1)
+            self.assertEqual(len(w), 1)
+
+            # Catched with python error should not be detected
+            with self.assertRaisesRegex(SystemError, "bad argument to internal function"):
+                warn_mod.catched(t, 2)
+            self.assertEqual(len(w), 1)
+
+            # Catched with pybind error should not be detected
+            # Note that there is no type name translation for pybind errors
+            with self.assertRaisesRegex(KeyError, "Variable\[CPUDoubleType\]"):
+                warn_mod.catched(t, 3)
+            self.assertEqual(len(w), 1)
+
+        # Locally make all warnings fail
+        # Make sure failing warnings don't cause issues
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error")
+
+            with self.assertRaisesRegex(UserWarning, t.type()):
+                warn_mod.catched(t, 0)
+
         # one batch
         matrix = random_fullrank_matrix_distinct_singular_value(5, 1).to(device)
         matrix_inverse = torch.inverse(matrix)
@@ -13315,6 +13396,7 @@ class TestDevicePrecision(TestCase):
         x = torch.randn(100, 100, device=devices[1], dtype=torch.float32)
         output = torch.ones_like(x)
         self.assertEqual(output, expected)
+
 
 
 add_neg_dim_tests()
